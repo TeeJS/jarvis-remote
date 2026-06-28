@@ -214,6 +214,30 @@ class TestOpenAICompatibleStreaming:
 
         assert backend.streaming("any", "sys", "user") is None
 
+    @patch("jarvis.llm.requests.post")
+    def test_falls_back_to_reasoning_content_when_content_never_arrives(self, mock_post):
+        """Reasoning models (GLM-4.7-flash on llama-server, etc.) can emit
+        only ``reasoning_content`` deltas when truncated mid-thought. The
+        stream must surface the buffered reasoning as the final reply so the
+        caller (and TTS) gets something instead of None."""
+        from jarvis.llm import OpenAICompatibleBackend
+
+        sse = [
+            b'data: {"choices": [{"delta": {"reasoning_content": "thinking "}}]}',
+            b'data: {"choices": [{"delta": {"reasoning_content": "hard"}}]}',
+            b"data: [DONE]",
+        ]
+        mock_post.return_value = _make_response(iter_lines=sse)
+        backend = OpenAICompatibleBackend("http://localhost:1234/v1")
+
+        seen: list[str] = []
+        result = backend.streaming("any", "sys", "user", on_token=seen.append)
+
+        assert result == "thinking hard"
+        # Reasoning is flushed as one chunk at end so TTS doesn't interleave
+        # it with content tokens in the happy path.
+        assert seen == ["thinking hard"]
+
 
 # ---------------------------------------------------------------------------
 # chat() — arbitrary messages, normalised to Ollama-shaped response
@@ -641,3 +665,52 @@ class TestNormaliseResponse:
 
         tc = result["message"]["tool_calls"][0]
         assert tc["function"]["arguments"] == "not valid json"
+
+    def test_empty_content_falls_back_to_reasoning_content(self):
+        """When a reasoning model exhausts its budget mid-thought it
+        returns ``content=""`` alongside a populated ``reasoning_content``.
+        Without a fallback the reply engine sees nothing and the turn
+        silently fails — fold the reasoning into ``content`` so callers
+        get partial output instead of None."""
+        from jarvis.llm.openai_compatible import _normalise_response
+
+        upstream = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "Let me think about this...",
+                    }
+                }
+            ]
+        }
+
+        result = _normalise_response(upstream)
+
+        assert result["message"]["content"] == "Let me think about this..."
+
+    def test_empty_content_with_tool_calls_keeps_content_empty(self):
+        """Empty ``content`` with a populated ``tool_calls`` is the normal
+        tool-dispatch shape — the agentic loop dispatches the tool and
+        synthesises the reply later. Folding reasoning into ``content``
+        here would shove chain-of-thought into the assistant message that
+        gets logged back into the conversation history."""
+        from jarvis.llm.openai_compatible import _normalise_response
+
+        upstream = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "I should call the tool",
+                        "tool_calls": [
+                            {"function": {"name": "x", "arguments": "{}"}}
+                        ],
+                    }
+                }
+            ]
+        }
+
+        result = _normalise_response(upstream)
+
+        assert result["message"]["content"] == ""

@@ -76,6 +76,17 @@ def _normalise_response(data: Dict[str, Any]) -> Dict[str, Any]:
                         decoded_tc["function"] = decoded_func
                     decoded_calls.append(decoded_tc)
                 decoded_msg["tool_calls"] = decoded_calls
+            # Reasoning models (e.g. GLM-4.7-flash on llama-server) split
+            # chain-of-thought into ``reasoning_content`` and only the final
+            # answer into ``content``. When the model is truncated mid-thought
+            # ``content`` is empty — surface the reasoning so callers see
+            # something instead of None. Skipped when ``tool_calls`` is set
+            # because empty content there is a normal tool-dispatch signal.
+            content = decoded_msg.get("content")
+            if (not isinstance(content, str) or not content.strip()) and not decoded_msg.get("tool_calls"):
+                reasoning = decoded_msg.get("reasoning_content")
+                if isinstance(reasoning, str) and reasoning.strip():
+                    decoded_msg["content"] = reasoning
             normalised["message"] = decoded_msg
             return normalised
 
@@ -188,6 +199,7 @@ class OpenAICompatibleBackend(LLMBackend):
                 resp.raise_for_status()
 
                 full_response: List[str] = []
+                reasoning_buffer: List[str] = []
                 for raw in resp.iter_lines():
                     if not raw:
                         continue
@@ -213,8 +225,17 @@ class OpenAICompatibleBackend(LLMBackend):
                         full_response.append(content)
                         if on_token:
                             on_token(content)
+                    # Buffer reasoning silently — TTS only hears it if the
+                    # model never reached a real ``content`` token.
+                    reasoning = delta.get("reasoning_content")
+                    if isinstance(reasoning, str) and reasoning:
+                        reasoning_buffer.append(reasoning)
 
                 result = "".join(full_response)
+                if not result.strip() and reasoning_buffer:
+                    result = "".join(reasoning_buffer)
+                    if on_token and result:
+                        on_token(result)
                 return result if result.strip() else None
         except requests.exceptions.Timeout:
             return None
